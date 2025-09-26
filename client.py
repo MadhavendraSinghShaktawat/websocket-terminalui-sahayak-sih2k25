@@ -9,12 +9,13 @@ import websockets
 
 
 WS_URL: str = "ws://10.161.116.188:8770"
-USERNAME: str = "madhav"
+USERNAME: str = "madhav1"
 IS_RASPBERRY: bool = False  # set True on the Raspberry Pi to enable vibration on receive
 
 # AI backends (adjust as needed)
 OLLAMA_URL: str = "http://localhost:11434"  # On laptop for TinyLlama
-SMOLLM_URL: str = "http://localhost:11434"   # On Pi for smollm HTTP endpoint
+SMOLLM_URL: str = "http://localhost:11434"   # On Pi/laptop smollm served via Ollama-compatible API
+SMOLLM_MODEL: str = "smollm2:135m-instruct-q4_K_S"
 
 
 class ChatUI:
@@ -269,16 +270,15 @@ async def ollama_generate(prompt: str, model: str = "tinyllama") -> str:
 
 
 async def smollm_generate(prompt: str) -> str:
-    # Adjust this to your smollm HTTP API
-    url = SMOLLM_URL.rstrip("/") + "/generate"
-    payload = {"prompt": prompt}
+    # Use Ollama-compatible /api/generate with explicit model
+    url = SMOLLM_URL.rstrip("/") + "/api/generate"
+    payload = {"model": SMOLLM_MODEL, "prompt": prompt, "stream": False}
     timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, json=payload) as resp:
             resp.raise_for_status()
             data = await resp.json()
-            # Accept common keys
-            return data.get("text") or data.get("response") or "(no response)"
+            return data.get("response", "") or "(no response)"
 
 
 def main() -> None:
