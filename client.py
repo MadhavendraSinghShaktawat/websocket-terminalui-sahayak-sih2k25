@@ -29,17 +29,35 @@ class ChatUI:
         start = max(0, len(self.messages) - msg_area_h)
         visible = self.messages[start:]
         for i, line in enumerate(visible[-msg_area_h:]):
-            self.stdscr.addnstr(i, 0, line, max(1, width - 1))
-        self.stdscr.hline(height - 2, 0, ord("-"), max(1, width - 1))
+            attr = curses.color_pair(1)
+            if line.startswith("[system]"):
+                attr = curses.color_pair(3) | curses.A_BOLD
+            elif line.startswith(f"{USERNAME}:"):
+                attr = curses.color_pair(2)
+            else:
+                attr = curses.color_pair(1)
+            try:
+                self.stdscr.addnstr(i, 0, line, max(1, width - 1), attr)
+            except Exception:
+                pass
+        # separator line
+        try:
+            self.stdscr.hline(height - 2, 0, ord("-"), max(1, width - 1))
+        except Exception:
+            pass
+        # prompt
         prompt = f"{USERNAME}> {self.input_buffer}"
-        self.stdscr.addnstr(height - 1, 0, prompt, max(1, width - 1))
+        try:
+            self.stdscr.addnstr(height - 1, 0, prompt, max(1, width - 1), curses.color_pair(4) | curses.A_BOLD)
+        except Exception:
+            pass
         self.stdscr.refresh()
 
 
 async def _trigger_vibration() -> None:
     try:
         proc = await asyncio.create_subprocess_shell(
-            "python3 -c \"from gpiozero import LED; from time import sleep; led=LED(20); led.on(); sleep(5); led.off()\"",
+            "python3 -c \"from gpiozero import LED; from time import sleep; led=LED(20); led.on(); sleep(1); led.off()\"",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -128,6 +146,17 @@ async def sender_loop(ui: ChatUI, url: str, outgoing: "asyncio.Queue[str]") -> N
 
 async def run(stdscr: "curses._CursesWindow") -> None:
     curses.curs_set(1)
+    if curses.has_colors():
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+        except Exception:
+            pass
+        # color pairs: 1=others, 2=self, 3=system, 4=prompt
+        curses.init_pair(1, curses.COLOR_WHITE, -1)
+        curses.init_pair(2, curses.COLOR_CYAN, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_GREEN, -1)
     stdscr.nodelay(True)
     stdscr.keypad(True)
     ui = ChatUI(stdscr)
