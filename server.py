@@ -12,6 +12,8 @@ clients: Set[websockets.WebSocketServerProtocol] = set()
 async def handle_client(websocket: websockets.WebSocketServerProtocol) -> None:
     clients.add(websocket)
     try:
+        peer = getattr(websocket, "remote_address", None)
+        print(f"client connected: {peer}")
         async for message in websocket:
             try:
                 data = json.loads(message)
@@ -25,12 +27,18 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol) -> None:
             except json.JSONDecodeError:
                 continue
 
+            print(f"message from {user}: {text}")
             payload = json.dumps({"user": user, "text": text}, separators=(",", ":"))
             # Broadcast to all connected clients
             if clients:
                 await asyncio.gather(*(c.send(payload) for c in list(clients) if c.open), return_exceptions=True)
     finally:
         clients.discard(websocket)
+        try:
+            peer = getattr(websocket, "remote_address", None)
+            print(f"client disconnected: {peer}")
+        except Exception:
+            pass
 
 
 async def main() -> None:

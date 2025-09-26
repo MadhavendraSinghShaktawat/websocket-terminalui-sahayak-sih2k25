@@ -1,14 +1,13 @@
 import asyncio
 import curses
 import json
-import os
 from typing import List, Optional
 
 import websockets
 
 
-WS_URL: str = os.getenv("CHAT_WS_URL", "ws://192.168.1.100:8770")
-USERNAME: str = os.getenv("CHAT_USERNAME", "pi-zero")
+WS_URL: str = "ws://10.161.116.188:8770"
+USERNAME: str = "pi-zero"
 
 
 class ChatUI:
@@ -50,41 +49,56 @@ async def ws_receiver(ui: ChatUI, url: str) -> None:
                     except Exception:
                         continue
         except Exception as exc:
-            ui.append_message(f"[system] ws error: {exc}; reconnecting in 2s")
+            ui.append_message(f"[system] ws error: {repr(exc)}; reconnecting in 2s")
             await asyncio.sleep(2)
 
 
-async def keyboard_and_sender(ui: ChatUI, url: str) -> None:
+async def keyboard_loop(ui: ChatUI, outgoing: "asyncio.Queue[str]") -> None:
+    while True:
+        ch = ui.stdscr.getch()
+        if ch == -1:
+            await asyncio.sleep(0.01)
+            continue
+        if ch in (curses.KEY_ENTER, 10, 13):
+            text = ui.input_buffer.strip()
+            if text:
+                await outgoing.put(text)
+                ui.append_message(f"{USERNAME}: {text}")
+            ui.input_buffer = ""
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            if ui.input_buffer:
+                ui.input_buffer = ui.input_buffer[:-1]
+        elif ch == curses.KEY_RESIZE:
+            pass
+        elif 32 <= ch <= 126:
+            ui.input_buffer += chr(ch)
+        ui.draw()
+
+
+async def sender_loop(ui: ChatUI, url: str, outgoing: "asyncio.Queue[str]") -> None:
     ws: Optional[websockets.WebSocketClientProtocol] = None
     while True:
         try:
             ws = await websockets.connect(url, max_size=None, ping_interval=20, ping_timeout=20)
-            ui.append_message(f"[system] ready to send to {url}")
+            # Announce join once per successful connection
+            try:
+                await ws.send(json.dumps({"user": USERNAME, "text": "[joined]"}, separators=(",", ":")))
+            except Exception:
+                pass
             while True:
-                ch = ui.stdscr.getch()
-                if ch == -1:
-                    await asyncio.sleep(0.01)
+                try:
+                    text = await asyncio.wait_for(outgoing.get(), timeout=0.1)
+                except asyncio.TimeoutError:
                     continue
-                if ch in (curses.KEY_ENTER, 10, 13):
-                    text = ui.input_buffer.strip()
-                    if text:
-                        payload = json.dumps({"user": USERNAME, "text": text}, separators=(",", ":"))
-                        try:
-                            await ws.send(payload)
-                            ui.append_message(f"{USERNAME}: {text}")
-                        except Exception as exc:
-                            ui.append_message(f"[system] send failed: {exc}")
-                    ui.input_buffer = ""
-                elif ch in (curses.KEY_BACKSPACE, 127, 8):
-                    if ui.input_buffer:
-                        ui.input_buffer = ui.input_buffer[:-1]
-                elif ch == curses.KEY_RESIZE:
-                    pass
-                elif 32 <= ch <= 126:
-                    ui.input_buffer += chr(ch)
-                ui.draw()
+                payload = json.dumps({"user": USERNAME, "text": text}, separators=(",", ":"))
+                try:
+                    await ws.send(payload)
+                except Exception as exc:
+                    # put back to queue and break to reconnect
+                    await outgoing.put(text)
+                    raise exc
         except Exception as exc:
-            ui.append_message(f"[system] sender error: {exc}; reconnecting in 2s")
+            ui.append_message(f"[system] send loop: {repr(exc)}; reconnecting in 2s")
             await asyncio.sleep(2)
         finally:
             if ws is not None:
@@ -102,7 +116,12 @@ async def run(stdscr: "curses._CursesWindow") -> None:
     ui = ChatUI(stdscr)
     ui.append_message("[system] Press Enter to send, Backspace to edit")
     ui.draw()
-    await asyncio.gather(ws_receiver(ui, WS_URL), keyboard_and_sender(ui, WS_URL))
+    outgoing: "asyncio.Queue[str]" = asyncio.Queue()
+    await asyncio.gather(
+        ws_receiver(ui, WS_URL),
+        keyboard_loop(ui, outgoing),
+        sender_loop(ui, WS_URL, outgoing),
+    )
 
 
 def main() -> None:
