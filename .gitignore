@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.build/
+.eggs/
+.python-version
+.pytest_cache/
+.coverage*
+htmlcov/
+
+# Virtual environments
+venv/
+.env/
+.venv/
+ENV/
+
+# Logs & dumps
+*.log
+*.log.*
+*.pid
+
+# Editors/IDEs
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node/alt tools (if used for testing)
+node_modules/
+
+# Dist
+build/
+dist/
+*/__pycache__/
+
+# Local overrides
+.env.local
+
+
