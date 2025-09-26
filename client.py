@@ -7,7 +7,8 @@ import websockets
 
 
 WS_URL: str = "ws://10.161.116.188:8770"
-USERNAME: str = "pi-zero"
+USERNAME: str = "madhav"
+IS_RASPBERRY: bool = False  # set True on the Raspberry Pi to enable vibration on receive
 
 
 class ChatUI:
@@ -35,17 +36,33 @@ class ChatUI:
         self.stdscr.refresh()
 
 
+async def _trigger_vibration() -> None:
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            "python3 -c \"from gpiozero import LED; from time import sleep; led=LED(20); led.on(); sleep(5); led.off()\"",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        # Let it run independently; do not await
+    except Exception:
+        pass
+
+
 async def ws_receiver(ui: ChatUI, url: str) -> None:
     while True:
         try:
             async with websockets.connect(url, max_size=None, ping_interval=20, ping_timeout=20) as ws:
                 ui.append_message(f"[system] connected to {url}")
+                ui.draw()
                 async for msg in ws:
                     try:
                         data = json.loads(msg)
                         user = data.get("user", "anon")
                         text = data.get("text", "")
                         ui.append_message(f"{user}: {text}")
+                        ui.draw()
+                        if IS_RASPBERRY and user != USERNAME:
+                            asyncio.create_task(_trigger_vibration())
                     except Exception:
                         continue
         except Exception as exc:
