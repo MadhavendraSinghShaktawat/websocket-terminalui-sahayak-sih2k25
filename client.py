@@ -3,12 +3,18 @@ import curses
 import json
 from typing import List, Optional
 
+import aiohttp
+
 import websockets
 
 
 WS_URL: str = "ws://10.161.116.188:8770"
 USERNAME: str = "madhav"
 IS_RASPBERRY: bool = False  # set True on the Raspberry Pi to enable vibration on receive
+
+# AI backends (adjust as needed)
+OLLAMA_URL: str = "http://localhost:11434"  # On laptop for TinyLlama
+SMOLLM_URL: str = "http://localhost:11434"   # On Pi for smollm HTTP endpoint
 
 
 class ChatUI:
@@ -88,7 +94,7 @@ async def ws_receiver(ui: ChatUI, url: str) -> None:
             await asyncio.sleep(2)
 
 
-async def keyboard_loop(ui: ChatUI, outgoing: "asyncio.Queue[str]") -> None:
+async def keyboard_loop(ui: ChatUI, outgoing_raw: "asyncio.Queue[str]") -> None:
     while True:
         ch = ui.stdscr.getch()
         if ch == -1:
@@ -97,8 +103,10 @@ async def keyboard_loop(ui: ChatUI, outgoing: "asyncio.Queue[str]") -> None:
         if ch in (curses.KEY_ENTER, 10, 13):
             text = ui.input_buffer.strip()
             if text:
-                await outgoing.put(text)
-                ui.append_message(f"{USERNAME}: {text}")
+                await outgoing_raw.put(text)
+                # Only echo plain messages locally; commands will be echoed after generation
+                if not text.startswith("/"):
+                    ui.append_message(f"{USERNAME}: {text}")
             ui.input_buffer = ""
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
             if ui.input_buffer:
@@ -110,7 +118,7 @@ async def keyboard_loop(ui: ChatUI, outgoing: "asyncio.Queue[str]") -> None:
         ui.draw()
 
 
-async def sender_loop(ui: ChatUI, url: str, outgoing: "asyncio.Queue[str]") -> None:
+async def sender_loop(ui: ChatUI, url: str, outgoing_send: "asyncio.Queue[str]") -> None:
     ws: Optional[websockets.WebSocketClientProtocol] = None
     while True:
         try:
@@ -122,7 +130,7 @@ async def sender_loop(ui: ChatUI, url: str, outgoing: "asyncio.Queue[str]") -> N
                 pass
             while True:
                 try:
-                    text = await asyncio.wait_for(outgoing.get(), timeout=0.1)
+                    text = await asyncio.wait_for(outgoing_send.get(), timeout=0.1)
                 except asyncio.TimeoutError:
                     continue
                 payload = json.dumps({"user": USERNAME, "text": text}, separators=(",", ":"))
@@ -130,7 +138,7 @@ async def sender_loop(ui: ChatUI, url: str, outgoing: "asyncio.Queue[str]") -> N
                     await ws.send(payload)
                 except Exception as exc:
                     # put back to queue and break to reconnect
-                    await outgoing.put(text)
+                    await outgoing_send.put(text)
                     raise exc
         except Exception as exc:
             ui.append_message(f"[system] send loop: {repr(exc)}; reconnecting in 2s")
@@ -142,6 +150,59 @@ async def sender_loop(ui: ChatUI, url: str, outgoing: "asyncio.Queue[str]") -> N
                 except Exception:
                     pass
                 ws = None
+
+
+async def command_loop(ui: ChatUI, outgoing_raw: "asyncio.Queue[str]", outgoing_send: "asyncio.Queue[str]") -> None:
+    while True:
+        try:
+            text = await asyncio.wait_for(outgoing_raw.get(), timeout=0.05)
+        except asyncio.TimeoutError:
+            await asyncio.sleep(0.01)
+            continue
+
+        # Handle commands
+        if text.startswith("/quiz"):
+            if USERNAME != "madhav":
+                ui.append_message("[system] /quiz is restricted to 'madhav'.")
+                ui.draw()
+                continue
+            topic = text[len("/quiz"):].strip() or "general knowledge"
+            ui.append_message(f"[system] generating quiz on '{topic}' ...")
+            ui.draw()
+            try:
+                quiz = await generate_quiz(topic)
+                ui.append_message(f"{USERNAME}: {quiz}")
+                ui.draw()
+                await outgoing_send.put(quiz)
+            except Exception as exc:
+                ui.append_message(f"[system] quiz failed: {exc}")
+                ui.draw()
+            continue
+
+        if text.startswith("/summary"):
+            if USERNAME == "madhav":
+                ui.append_message("[system] /summary is not allowed for 'madhav'.")
+                ui.draw()
+                continue
+            content = text[len("/summary"):].strip()
+            if not content:
+                ui.append_message("[system] usage: /summary <text>")
+                ui.draw()
+                continue
+            ui.append_message("[system] summarizing ...")
+            ui.draw()
+            try:
+                summ = await summarize_text(content)
+                ui.append_message(f"{USERNAME}: {summ}")
+                ui.draw()
+                await outgoing_send.put(summ)
+            except Exception as exc:
+                ui.append_message(f"[system] summary failed: {exc}")
+                ui.draw()
+            continue
+
+        # Not a command: forward as normal
+        await outgoing_send.put(text)
 
 
 async def run(stdscr: "curses._CursesWindow") -> None:
@@ -162,12 +223,62 @@ async def run(stdscr: "curses._CursesWindow") -> None:
     ui = ChatUI(stdscr)
     ui.append_message("[system] Press Enter to send, Backspace to edit")
     ui.draw()
-    outgoing: "asyncio.Queue[str]" = asyncio.Queue()
+    outgoing_raw: "asyncio.Queue[str]" = asyncio.Queue()
+    outgoing_send: "asyncio.Queue[str]" = asyncio.Queue()
     await asyncio.gather(
         ws_receiver(ui, WS_URL),
-        keyboard_loop(ui, outgoing),
-        sender_loop(ui, WS_URL, outgoing),
+        keyboard_loop(ui, outgoing_raw),
+        command_loop(ui, outgoing_raw, outgoing_send),
+        sender_loop(ui, WS_URL, outgoing_send),
     )
+
+
+async def generate_quiz(topic: str) -> str:
+    prompt = (
+        "Write exactly ONE multiple-choice question about '" + topic + "' in this exact format, each on its own line:"\
+        "\nQ: <question>"\
+        "\nA) <option A>"\
+        "\nB) <option B>"\
+        "\nC) <option C>"\
+        "\nD) <option D>"\
+        "\nDo NOT include the answer or any explanations. Keep all lines concise."
+    )
+    if IS_RASPBERRY:
+        return await smollm_generate(prompt)
+    return await ollama_generate(prompt, model="tinyllama")
+
+
+async def summarize_text(text: str) -> str:
+    prompt = "Summarize concisely in 3-5 bullet points:\n\n" + text
+    # Prefer smollm; fallback to ollama if smollm fails
+    try:
+        return await smollm_generate(prompt)
+    except Exception:
+        return await ollama_generate(prompt, model="tinyllama")
+
+
+async def ollama_generate(prompt: str, model: str = "tinyllama") -> str:
+    url = OLLAMA_URL.rstrip("/") + "/api/generate"
+    payload = {"model": model, "prompt": prompt, "stream": False}
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, json=payload) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            return data.get("response", "") or "(no response)"
+
+
+async def smollm_generate(prompt: str) -> str:
+    # Adjust this to your smollm HTTP API
+    url = SMOLLM_URL.rstrip("/") + "/generate"
+    payload = {"prompt": prompt}
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, json=payload) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            # Accept common keys
+            return data.get("text") or data.get("response") or "(no response)"
 
 
 def main() -> None:
