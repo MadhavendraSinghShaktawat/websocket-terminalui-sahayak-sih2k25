@@ -1,6 +1,7 @@
 import asyncio
 import curses
 import json
+import re
 from typing import List, Optional
 
 import aiohttp
@@ -9,7 +10,7 @@ import websockets
 
 
 WS_URL: str = "ws://10.161.116.188:8770"
-USERNAME: str = "madhav1"
+USERNAME: str = "madhav"
 IS_RASPBERRY: bool = False  # set True on the Raspberry Pi to enable vibration on receive
 
 # AI backends (adjust as needed)
@@ -23,6 +24,7 @@ class ChatUI:
         self.stdscr = stdscr
         self.messages: List[str] = []
         self.input_buffer: str = ""
+        self.scroll_offset: int = 0  # 0 = follow tail; >0 = scrolled up by N lines
 
     def append_message(self, text: str) -> None:
         self.messages.append(text)
@@ -33,8 +35,12 @@ class ChatUI:
         self.stdscr.erase()
         height, width = self.stdscr.getmaxyx()
         msg_area_h = max(1, height - 2)
-        start = max(0, len(self.messages) - msg_area_h)
-        visible = self.messages[start:]
+        total = len(self.messages)
+        max_offset = max(0, total - msg_area_h)
+        self.scroll_offset = max(0, min(self.scroll_offset, max_offset))
+        start = max(0, total - msg_area_h - self.scroll_offset)
+        end = min(total, start + msg_area_h)
+        visible = self.messages[start:end]
         for i, line in enumerate(visible[-msg_area_h:]):
             attr = curses.color_pair(1)
             if line.startswith("[system]"):
@@ -84,8 +90,13 @@ async def ws_receiver(ui: ChatUI, url: str) -> None:
                         data = json.loads(msg)
                         user = data.get("user", "anon")
                         text = data.get("text", "")
+                        # Do not duplicate sender's own messages locally
+                        if user == USERNAME:
+                            continue
                         ui.append_message(f"{user}: {text}")
-                        ui.draw()
+                        # Auto-follow only if not scrolled up
+                        if ui.scroll_offset == 0:
+                            ui.draw()
                         if IS_RASPBERRY and user != USERNAME:
                             asyncio.create_task(_trigger_vibration())
                     except Exception:
@@ -100,6 +111,23 @@ async def keyboard_loop(ui: ChatUI, outgoing_raw: "asyncio.Queue[str]") -> None:
         ch = ui.stdscr.getch()
         if ch == -1:
             await asyncio.sleep(0.01)
+            continue
+        # Scrolling
+        if ch in (curses.KEY_PPAGE,):  # Page Up
+            ui.scroll_offset += 1
+            ui.draw()
+            continue
+        if ch in (curses.KEY_NPAGE,):  # Page Down
+            ui.scroll_offset = max(0, ui.scroll_offset - 1)
+            ui.draw()
+            continue
+        if ch == curses.KEY_UP:
+            ui.scroll_offset += 1
+            ui.draw()
+            continue
+        if ch == curses.KEY_DOWN:
+            ui.scroll_offset = max(0, ui.scroll_offset - 1)
+            ui.draw()
             continue
         if ch in (curses.KEY_ENTER, 10, 13):
             text = ui.input_buffer.strip()
@@ -235,18 +263,100 @@ async def run(stdscr: "curses._CursesWindow") -> None:
 
 
 async def generate_quiz(topic: str) -> str:
-    prompt = (
-        "Write exactly ONE multiple-choice question about '" + topic + "' in this exact format, each on its own line:"\
-        "\nQ: <question>"\
-        "\nA) <option A>"\
-        "\nB) <option B>"\
-        "\nC) <option C>"\
-        "\nD) <option D>"\
-        "\nDo NOT include the answer or any explanations. Keep all lines concise."
+    base_prompt = (
+        "Create exactly ONE multiple-choice question about '" + topic + "'. "
+        "Output ONLY in this format (no extra text):"\
+        "\nQ: <on-topic question ending with ?>"\
+        "\nA) <concise option>"\
+        "\nB) <concise option>"\
+        "\nC) <concise option>"\
+        "\nD) <concise option>"\
+        "\nConstraints:"\
+        "\n- Exactly one option is correct; other three are plausible distractors."\
+        "\n- Keep each option under 12 words and similar length/style."\
+        "\n- Options must be specific to the topic; no jokes, no meta, no 'True/False' unless directly relevant."\
+        "\n- Do NOT include the answer or any explanation."
     )
-    if IS_RASPBERRY:
-        return await smollm_generate(prompt)
-    return await ollama_generate(prompt, model="tinyllama")
+    strict_prompt = base_prompt + "\nReturn only lines that start with 'Q:' or 'A)'/'B)'/'C)'/'D)'. No other text."
+
+    async def _call_model(p: str) -> str:
+        if IS_RASPBERRY:
+            return await smollm_generate(p)
+        return await ollama_generate(p, model="tinyllama")
+
+    # Try up to 2 times
+    raw = await _call_model(base_prompt)
+    normalized = _normalize_quiz_output(raw, topic)
+    if not _quiz_is_valid(normalized):
+        raw = await _call_model(strict_prompt)
+        normalized = _normalize_quiz_output(raw, topic)
+    # Final fallback: ensure valid structure even if weak content
+    if not _quiz_is_valid(normalized):
+        normalized = _fallback_quiz(topic)
+    return normalized
+
+
+def _normalize_quiz_output(raw: str, topic: str) -> str:
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    q = None
+    opts: List[str] = []
+    for ln in lines:
+        m = re.match(r"^([A-Da-d])[)\.]\s*(.*)$", ln)
+        if m:
+            label = m.group(1).upper()
+            text = m.group(2).strip()
+            if text and text not in ("...", "..."):
+                opts.append(f"{label}) {text}")
+            continue
+        if q is None and '?' in ln and not re.match(r"^[A-Da-d][)\.]", ln):
+            if ln.lower().startswith('q:'):
+                ln = ln[2:].strip()
+            ln = re.sub(r"(?i)multiple[- ]choice.*?format.*?:?\s*", "", ln)
+            ln = re.sub(r"(?i)output.*?:?\s*", "", ln)
+            q = ln.strip()
+    opts = opts[:4]
+    # Deduplicate options and filter empty/meta
+    seen = set()
+    clean_opts: List[str] = []
+    for o in opts:
+        key = o.split(") ", 1)[-1].lower()
+        if key and key not in seen and not key.startswith("option ") and key != "...":
+            seen.add(key)
+            clean_opts.append(o)
+    opts = clean_opts
+    # Pad missing options
+    labels = ["A", "B", "C", "D"]
+    next_idx = 0
+    while len(opts) < 4 and next_idx < 4:
+        label = labels[next_idx]
+        if all(not o.startswith(f"{label})") for o in opts):
+            opts.append(f"{label}) {topic} concept")
+        next_idx += 1
+    if q is None or not q.endswith('?'):
+        q = f"What is a key concept of {topic}?"
+    return "\n".join([f"Q: {q}"] + opts[:4])
+
+
+def _quiz_is_valid(text: str) -> bool:
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 5:
+        return False
+    if not lines[0].startswith("Q:") or not lines[0].strip().endswith("?"):
+        return False
+    labels = ["A)", "B)", "C)", "D)"]
+    got = [any(ln.startswith(l) and len(ln) > len(l) + 1 for ln in lines[1:]) for l in labels]
+    return all(got)
+
+
+def _fallback_quiz(topic: str) -> str:
+    q = f"Which of the following is a core idea in {topic}?"
+    opts = [
+        "A) Variables and expressions",
+        "B) Photosynthesis",
+        "C) Plate tectonics",
+        "D) Musical tempo",
+    ]
+    return "\n".join([f"Q: {q}"] + opts)
 
 
 async def summarize_text(text: str) -> str:
